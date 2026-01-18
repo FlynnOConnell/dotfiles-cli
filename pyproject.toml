@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 dotfiles = "dotfiles_cli.cli:main"
+dotfiles-cli = "dotfiles_cli.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/FlynnOConnell/dotfiles-cli"
