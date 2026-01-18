@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dotfiles-cli"
-version = "0.1.3"
+version = "0.1.4"
 description = "CLI tool to sync and manage dotfiles across machines"
 readme = "README.md"
 license = "MIT"
