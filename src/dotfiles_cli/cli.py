@@ -17,6 +17,8 @@ console = Console()
 # default paths
 DEFAULT_DOTFILES_REPO = "https://github.com/FlynnOConnell/.dotfiles.git"
 DEFAULT_DOTFILES_DIR = Path.home() / "repos" / ".dotfiles"
+DEFAULT_NOTES_REPO = "https://github.com/FlynnOConnell/docs.git"
+DEFAULT_NOTES_DIR = Path.home() / "repos" / "docs"
 
 
 def get_dotfiles_dir() -> Path:
@@ -25,6 +27,14 @@ def get_dotfiles_dir() -> Path:
     if env_path:
         return Path(env_path)
     return DEFAULT_DOTFILES_DIR
+
+
+def get_notes_dir() -> Path:
+    """get notes directory from env or default."""
+    env_path = os.environ.get("NOTES_DIR")
+    if env_path:
+        return Path(env_path)
+    return DEFAULT_NOTES_DIR
 
 
 def run_cmd(
@@ -387,6 +397,269 @@ def edit() -> None:
 
     console.print(f"[cyan]opening {dotfiles_dir} in {editor}...[/cyan]")
     subprocess.run([editor, str(dotfiles_dir)])
+
+
+# =============================================================================
+# NOTES COMMANDS
+# =============================================================================
+
+
+@click.group("notes")
+def notes_cli() -> None:
+    """
+    sync notes/docs repository across machines.
+
+    \b
+    uses GitHub as source of truth.
+    set NOTES_DIR env var to customize location (default: ~/repos/docs)
+    """
+    pass
+
+
+@notes_cli.command("status")
+def notes_status() -> None:
+    """show notes repository status."""
+    notes_dir = get_notes_dir()
+
+    if not notes_dir.exists():
+        console.print(f"[red]notes not found at {notes_dir}[/red]")
+        console.print("run 'dotfiles notes clone' first")
+        raise click.Abort()
+
+    console.print(f"[bold blue]notes status[/bold blue] ({notes_dir})\n")
+
+    # git status
+    result = run_cmd(["git", "status", "--short"], cwd=notes_dir, check=False, quiet=True)
+    if result.stdout.strip():
+        console.print("[cyan]local changes:[/cyan]")
+        for line in result.stdout.strip().split("\n")[:20]:
+            console.print(f"  {line}")
+        total = len(result.stdout.strip().split("\n"))
+        if total > 20:
+            console.print(f"  ... and {total - 20} more")
+    else:
+        console.print("[green]working tree clean[/green]")
+
+    # branch info
+    result = run_cmd(["git", "branch", "--show-current"], cwd=notes_dir, check=False, quiet=True)
+    branch = result.stdout.strip() if result.stdout else "unknown"
+
+    # check remote status
+    run_cmd(["git", "fetch", "--quiet"], cwd=notes_dir, check=False, quiet=True)
+
+    # commits behind
+    result = run_cmd(
+        ["git", "rev-list", "--count", f"{branch}..origin/{branch}"],
+        cwd=notes_dir,
+        check=False,
+        quiet=True,
+    )
+    behind = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+
+    # commits ahead
+    result = run_cmd(
+        ["git", "rev-list", "--count", f"origin/{branch}..{branch}"],
+        cwd=notes_dir,
+        check=False,
+        quiet=True,
+    )
+    ahead = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+
+    if behind > 0 and ahead > 0:
+        console.print(f"[yellow]branch {branch}: {ahead} ahead, {behind} behind origin[/yellow]")
+    elif behind > 0:
+        console.print(f"[yellow]branch {branch}: {behind} commit(s) behind origin[/yellow]")
+    elif ahead > 0:
+        console.print(f"[cyan]branch {branch}: {ahead} commit(s) ahead of origin[/cyan]")
+    else:
+        console.print(f"[green]branch {branch} is up to date with origin[/green]")
+
+
+@notes_cli.command("pull")
+@click.option("--hard", is_flag=True, help="hard reset to origin (discards local changes)")
+def notes_pull(hard: bool) -> None:
+    """
+    pull latest notes from GitHub.
+
+    \b
+    examples:
+      dotfiles notes pull          # merge remote changes
+      dotfiles notes pull --hard   # reset to origin (discard local)
+    """
+    notes_dir = get_notes_dir()
+
+    if not notes_dir.exists():
+        console.print(f"[red]notes not found at {notes_dir}[/red]")
+        raise click.Abort()
+
+    console.print(f"[bold blue]pulling notes[/bold blue] from {notes_dir}\n")
+
+    if hard:
+        console.print("[yellow]hard reset: discarding local changes...[/yellow]")
+        run_cmd(["git", "fetch", "origin"], cwd=notes_dir)
+        result = run_cmd(["git", "branch", "--show-current"], cwd=notes_dir, check=False, quiet=True)
+        branch = result.stdout.strip() if result.stdout else "master"
+        run_cmd(["git", "reset", "--hard", f"origin/{branch}"], cwd=notes_dir)
+        # clean untracked files too
+        run_cmd(["git", "clean", "-fd"], cwd=notes_dir)
+        console.print("[green]reset to origin complete[/green]")
+    else:
+        console.print("[cyan]pulling with rebase...[/cyan]")
+        result = run_cmd(["git", "pull", "--rebase"], cwd=notes_dir, check=False)
+        if result.returncode != 0:
+            console.print("[red]pull failed - you may have conflicts[/red]")
+            console.print("resolve conflicts manually or use --hard to reset")
+            raise click.Abort()
+
+    console.print("\n[bold green]notes pulled successfully[/bold green]")
+
+
+@notes_cli.command("push")
+@click.option("-m", "--message", default=None, help="commit message")
+@click.option("--all", "-a", "add_all", is_flag=True, help="add all changes before committing")
+def notes_push(message: str | None, add_all: bool) -> None:
+    """
+    commit and push notes to GitHub.
+
+    \b
+    examples:
+      dotfiles notes push                    # push existing commits
+      dotfiles notes push -a -m "updates"    # add all, commit, push
+    """
+    notes_dir = get_notes_dir()
+
+    if not notes_dir.exists():
+        console.print(f"[red]notes not found at {notes_dir}[/red]")
+        raise click.Abort()
+
+    console.print(f"[bold blue]pushing notes[/bold blue] from {notes_dir}\n")
+
+    # check for uncommitted changes
+    result = run_cmd(["git", "status", "--porcelain"], cwd=notes_dir, check=False, quiet=True)
+    has_changes = bool(result.stdout.strip())
+
+    if has_changes:
+        if add_all:
+            console.print("[cyan]staging all changes...[/cyan]")
+            run_cmd(["git", "add", "-A"], cwd=notes_dir)
+
+            if not message:
+                message = click.prompt("commit message", default="update notes")
+
+            run_cmd(["git", "commit", "-m", message], cwd=notes_dir)
+        else:
+            console.print("[yellow]uncommitted changes detected[/yellow]")
+            console.print("use --all to add and commit, or commit manually first")
+            raise click.Abort()
+
+    # push
+    console.print("[cyan]pushing to origin...[/cyan]")
+    run_cmd(["git", "push"], cwd=notes_dir)
+
+    console.print("\n[bold green]notes pushed successfully[/bold green]")
+
+
+@notes_cli.command("sync")
+@click.option("-m", "--message", default=None, help="commit message for local changes")
+def notes_sync(message: str | None) -> None:
+    """
+    two-way sync: commit local changes, pull remote, push.
+
+    \b
+    this is the recommended way to sync notes across machines.
+    GitHub is treated as the source of truth for conflicts.
+
+    \b
+    workflow:
+      1. stash local uncommitted changes
+      2. pull and rebase on origin
+      3. apply stashed changes
+      4. commit and push
+
+    \b
+    examples:
+      dotfiles notes sync
+      dotfiles notes sync -m "work updates"
+    """
+    notes_dir = get_notes_dir()
+
+    if not notes_dir.exists():
+        console.print(f"[red]notes not found at {notes_dir}[/red]")
+        raise click.Abort()
+
+    console.print(f"[bold blue]syncing notes[/bold blue] ({notes_dir})\n")
+
+    # check for uncommitted changes
+    result = run_cmd(["git", "status", "--porcelain"], cwd=notes_dir, check=False, quiet=True)
+    has_uncommitted = bool(result.stdout.strip())
+
+    # stash if needed
+    if has_uncommitted:
+        console.print("[cyan]stashing local changes...[/cyan]")
+        run_cmd(["git", "stash", "push", "-m", "dotfiles-cli auto-stash"], cwd=notes_dir)
+
+    # pull with rebase
+    console.print("[cyan]pulling from origin...[/cyan]")
+    result = run_cmd(["git", "pull", "--rebase"], cwd=notes_dir, check=False)
+
+    if result.returncode != 0:
+        console.print("[red]pull failed - conflicts detected[/red]")
+        if has_uncommitted:
+            console.print("[yellow]your changes are in git stash[/yellow]")
+        raise click.Abort()
+
+    # pop stash if we stashed
+    if has_uncommitted:
+        console.print("[cyan]restoring local changes...[/cyan]")
+        result = run_cmd(["git", "stash", "pop"], cwd=notes_dir, check=False)
+
+        if result.returncode != 0:
+            console.print("[yellow]stash pop had conflicts - resolve manually[/yellow]")
+            raise click.Abort()
+
+        # commit the changes
+        if not message:
+            message = "sync notes"
+
+        console.print(f"[cyan]committing: {message}[/cyan]")
+        run_cmd(["git", "add", "-A"], cwd=notes_dir)
+        run_cmd(["git", "commit", "-m", message], cwd=notes_dir, check=False)
+
+    # push
+    console.print("[cyan]pushing to origin...[/cyan]")
+    run_cmd(["git", "push"], cwd=notes_dir)
+
+    console.print("\n[bold green]notes synced successfully[/bold green]")
+
+
+@notes_cli.command("clone")
+@click.option("--repo", "-r", default=DEFAULT_NOTES_REPO, help="notes repo url")
+@click.option("--dir", "-d", "directory", default=None, help="install directory")
+def notes_clone(repo: str, directory: str | None) -> None:
+    """
+    clone notes repository.
+
+    \b
+    examples:
+      dotfiles notes clone
+      dotfiles notes clone --dir ~/notes
+    """
+    notes_dir = Path(directory) if directory else get_notes_dir()
+
+    if notes_dir.exists():
+        console.print(f"[yellow]notes already exist at {notes_dir}[/yellow]")
+        raise click.Abort()
+
+    console.print(f"[bold blue]cloning notes[/bold blue] to {notes_dir}\n")
+
+    notes_dir.parent.mkdir(parents=True, exist_ok=True)
+    run_cmd(["git", "clone", repo, str(notes_dir)])
+
+    console.print("\n[bold green]notes cloned successfully[/bold green]")
+
+
+# register notes subgroup
+main.add_command(notes_cli)
 
 
 if __name__ == "__main__":

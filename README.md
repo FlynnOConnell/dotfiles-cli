@@ -39,17 +39,44 @@ dotfiles push kickstart.nvim     # push submodule first
 dotfiles edit
 ```
 
+### Notes Sync
+
+Sync notes/docs across machines with GitHub as source of truth:
+
+```bash
+# clone notes repo (first time)
+dotfiles notes clone
+
+# check status
+dotfiles notes status
+
+# two-way sync (recommended)
+dotfiles notes sync
+
+# pull only (with optional hard reset)
+dotfiles notes pull
+dotfiles notes pull --hard  # discard local, reset to GitHub
+
+# push local changes
+dotfiles notes push -a -m "update notes"
+```
+
 ## Configuration
 
-By default, dotfiles-cli expects your dotfiles at `~/repos/.dotfiles`.
+By default, dotfiles-cli expects:
+- dotfiles at `~/repos/.dotfiles`
+- notes at `~/repos/docs`
 
-Override with environment variable:
+Override with environment variables:
 
 ```bash
 export DOTFILES_DIR=~/my-dotfiles
+export NOTES_DIR=~/my-notes
 ```
 
 ## Commands
+
+### Dotfiles
 
 | Command | Description |
 |---------|-------------|
@@ -59,6 +86,16 @@ export DOTFILES_DIR=~/my-dotfiles
 | `update` | Update submodules |
 | `push` | Commit and push changes |
 | `edit` | Open dotfiles in $EDITOR |
+
+### Notes
+
+| Command | Description |
+|---------|-------------|
+| `notes clone` | Clone notes repository |
+| `notes status` | Show notes repo status |
+| `notes sync` | Two-way sync (stash, pull, push) |
+| `notes pull` | Pull from GitHub (--hard to reset) |
+| `notes push` | Commit and push to GitHub |
 
 ## Platform Support
 
