@@ -658,6 +658,211 @@ def notes_clone(repo: str, directory: str | None) -> None:
     console.print("\n[bold green]notes cloned successfully[/bold green]")
 
 
+@notes_cli.command("watch")
+@click.option("--interval", "-i", default=300, help="poll interval in seconds (default: 300)")
+@click.option("--once", is_flag=True, help="check once and exit (don't loop)")
+@click.option("--notify", is_flag=True, help="show desktop notifications")
+@click.option("--auto-commit", is_flag=True, help="auto-commit local changes before pulling")
+@click.option("--on-conflict", type=click.Choice(["stash", "backup", "skip"]), default="stash",
+              help="how to handle local changes: stash (default), backup to file, or skip pull")
+def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_conflict: str) -> None:
+    """
+    watch for remote changes and auto-pull.
+
+    \b
+    runs in a loop, checking GitHub for updates and pulling when behind.
+    handles local changes according to --on-conflict strategy.
+
+    \b
+    conflict strategies:
+      stash   - stash local changes, pull, pop stash (default)
+      backup  - backup changed files to .backup/, reset to origin
+      skip    - skip pull if local changes exist
+
+    \b
+    examples:
+      dotfiles notes watch                    # check every 5 min
+      dotfiles notes watch -i 60              # check every minute
+      dotfiles notes watch --once             # check once and exit
+      dotfiles notes watch --notify           # show desktop notifications
+      dotfiles notes watch --on-conflict=skip # don't pull if local changes
+    """
+    import time
+    from datetime import datetime
+
+    notes_dir = get_notes_dir()
+
+    if not notes_dir.exists():
+        console.print(f"[red]notes not found at {notes_dir}[/red]")
+        raise click.Abort()
+
+    def send_notification(title: str, message: str) -> None:
+        """send desktop notification if enabled."""
+        if not notify:
+            return
+        try:
+            if is_windows():
+                # use powershell for windows toast
+                ps_cmd = f'''
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+                $template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+                $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
+                $xml.GetElementsByTagName("text")[0].AppendChild($xml.CreateTextNode("{title}")) | Out-Null
+                $xml.GetElementsByTagName("text")[1].AppendChild($xml.CreateTextNode("{message}")) | Out-Null
+                $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+                [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("dotfiles-cli").Show($toast)
+                '''
+                subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+            else:
+                # use notify-send on linux
+                subprocess.run(["notify-send", title, message], capture_output=True)
+        except Exception:
+            pass  # notifications are best-effort
+
+    def get_status() -> tuple[int, int, bool]:
+        """return (commits_behind, commits_ahead, has_local_changes)."""
+        run_cmd(["git", "fetch", "--quiet"], cwd=notes_dir, check=False, quiet=True)
+
+        result = run_cmd(["git", "branch", "--show-current"], cwd=notes_dir, check=False, quiet=True)
+        branch = result.stdout.strip() if result.stdout else "master"
+
+        result = run_cmd(
+            ["git", "rev-list", "--count", f"{branch}..origin/{branch}"],
+            cwd=notes_dir, check=False, quiet=True
+        )
+        behind = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+
+        result = run_cmd(
+            ["git", "rev-list", "--count", f"origin/{branch}..{branch}"],
+            cwd=notes_dir, check=False, quiet=True
+        )
+        ahead = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
+
+        result = run_cmd(["git", "status", "--porcelain"], cwd=notes_dir, check=False, quiet=True)
+        has_changes = bool(result.stdout.strip())
+
+        return behind, ahead, has_changes
+
+    def backup_local_changes() -> list[str]:
+        """backup modified files to .backup/ directory."""
+        backup_dir = notes_dir / ".backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        result = run_cmd(["git", "status", "--porcelain"], cwd=notes_dir, check=False, quiet=True)
+        backed_up = []
+
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            # status is first 2 chars, filename after
+            status = line[:2]
+            filepath = line[3:].strip().strip('"')
+
+            if status.strip() in ["M", "MM", "A", "AM", "??"]:
+                src = notes_dir / filepath
+                if src.exists():
+                    dst = backup_dir / filepath
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    shutil.copy2(src, dst)
+                    backed_up.append(filepath)
+
+        return backed_up
+
+    def do_pull() -> bool:
+        """attempt to pull, return True if successful."""
+        result = run_cmd(["git", "pull", "--rebase"], cwd=notes_dir, check=False, quiet=True)
+        return result.returncode == 0
+
+    def check_and_pull() -> None:
+        """main check logic."""
+        behind, ahead, has_changes = get_status()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        if behind == 0:
+            console.print(f"[dim]{timestamp}[/dim] [green]up to date[/green]")
+            return
+
+        console.print(f"[dim]{timestamp}[/dim] [yellow]{behind} commit(s) behind origin[/yellow]")
+
+        if not has_changes:
+            # clean working tree, just pull
+            console.print(f"[dim]{timestamp}[/dim] [cyan]pulling...[/cyan]")
+            if do_pull():
+                console.print(f"[dim]{timestamp}[/dim] [green]pulled {behind} commit(s)[/green]")
+                send_notification("Notes Updated", f"Pulled {behind} commit(s) from GitHub")
+            else:
+                console.print(f"[dim]{timestamp}[/dim] [red]pull failed[/red]")
+                send_notification("Notes Pull Failed", "Check for conflicts")
+            return
+
+        # has local changes - handle according to strategy
+        console.print(f"[dim]{timestamp}[/dim] [yellow]local changes detected[/yellow]")
+
+        if on_conflict == "skip":
+            console.print(f"[dim]{timestamp}[/dim] [yellow]skipping pull (--on-conflict=skip)[/yellow]")
+            return
+
+        if on_conflict == "backup":
+            console.print(f"[dim]{timestamp}[/dim] [cyan]backing up local changes...[/cyan]")
+            backed_up = backup_local_changes()
+            if backed_up:
+                console.print(f"[dim]{timestamp}[/dim] backed up {len(backed_up)} file(s)")
+
+            # reset to origin
+            result = run_cmd(["git", "branch", "--show-current"], cwd=notes_dir, check=False, quiet=True)
+            branch = result.stdout.strip() if result.stdout else "master"
+            run_cmd(["git", "reset", "--hard", f"origin/{branch}"], cwd=notes_dir, quiet=True)
+            run_cmd(["git", "clean", "-fd"], cwd=notes_dir, quiet=True)
+            console.print(f"[dim]{timestamp}[/dim] [green]reset to origin, pulled {behind} commit(s)[/green]")
+            send_notification("Notes Updated", f"Pulled {behind} commit(s), local changes backed up")
+            return
+
+        if on_conflict == "stash":
+            if auto_commit:
+                console.print(f"[dim]{timestamp}[/dim] [cyan]auto-committing local changes...[/cyan]")
+                run_cmd(["git", "add", "-A"], cwd=notes_dir, quiet=True)
+                run_cmd(["git", "commit", "-m", "auto-commit before pull"], cwd=notes_dir, check=False, quiet=True)
+                has_changes = False
+
+            if has_changes:
+                console.print(f"[dim]{timestamp}[/dim] [cyan]stashing local changes...[/cyan]")
+                run_cmd(["git", "stash", "push", "-m", "dotfiles-watch auto-stash"], cwd=notes_dir, quiet=True)
+
+            console.print(f"[dim]{timestamp}[/dim] [cyan]pulling...[/cyan]")
+            pull_ok = do_pull()
+
+            if has_changes:
+                console.print(f"[dim]{timestamp}[/dim] [cyan]restoring stash...[/cyan]")
+                result = run_cmd(["git", "stash", "pop"], cwd=notes_dir, check=False, quiet=True)
+                if result.returncode != 0:
+                    console.print(f"[dim]{timestamp}[/dim] [red]stash pop conflict - resolve manually[/red]")
+                    console.print(f"[dim]{timestamp}[/dim] [yellow]your changes are in: git stash list[/yellow]")
+                    send_notification("Notes Conflict", "Stash pop failed - resolve manually")
+                    return
+
+            if pull_ok:
+                console.print(f"[dim]{timestamp}[/dim] [green]pulled {behind} commit(s)[/green]")
+                send_notification("Notes Updated", f"Pulled {behind} commit(s) from GitHub")
+            else:
+                console.print(f"[dim]{timestamp}[/dim] [red]pull failed[/red]")
+                send_notification("Notes Pull Failed", "Check for conflicts")
+
+    # main loop
+    console.print(f"[bold blue]watching notes[/bold blue] ({notes_dir})")
+    console.print(f"interval: {interval}s | conflict: {on_conflict} | notify: {notify}")
+    console.print("[dim]press Ctrl+C to stop[/dim]\n")
+
+    try:
+        while True:
+            check_and_pull()
+            if once:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]watch stopped[/yellow]")
+
+
 # register notes subgroup
 main.add_command(notes_cli)
 
