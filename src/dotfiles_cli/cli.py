@@ -663,15 +663,16 @@ def notes_clone(repo: str, directory: str | None) -> None:
 @click.option("--once", is_flag=True, help="check once and exit (don't loop)")
 @click.option("--notify", is_flag=True, help="show desktop notifications")
 @click.option("--auto-commit", is_flag=True, help="auto-commit local changes before pulling")
+@click.option("--auto-push", is_flag=True, help="auto-commit and push local changes (full two-way sync)")
 @click.option("--on-conflict", type=click.Choice(["stash", "backup", "skip"]), default="stash",
               help="how to handle local changes: stash (default), backup to file, or skip pull")
-def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_conflict: str) -> None:
+def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, auto_push: bool, on_conflict: str) -> None:
     """
     watch for remote changes and auto-pull.
 
     \b
     runs in a loop, checking GitHub for updates and pulling when behind.
-    handles local changes according to --on-conflict strategy.
+    with --auto-push, also commits and pushes local changes (full two-way sync).
 
     \b
     conflict strategies:
@@ -681,9 +682,9 @@ def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_c
 
     \b
     examples:
-      dotfiles notes watch                    # check every 5 min
+      dotfiles notes watch                    # check every 5 min, pull only
+      dotfiles notes watch --auto-push        # full two-way sync
       dotfiles notes watch -i 60              # check every minute
-      dotfiles notes watch --once             # check once and exit
       dotfiles notes watch --notify           # show desktop notifications
       dotfiles notes watch --on-conflict=skip # don't pull if local changes
     """
@@ -774,10 +775,53 @@ def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_c
         result = run_cmd(["git", "pull", "--rebase"], cwd=notes_dir, check=False, quiet=True)
         return result.returncode == 0
 
-    def check_and_pull() -> None:
-        """main check logic."""
-        behind, ahead, has_changes = get_status()
+    def check_and_sync() -> None:
+        """main check logic with optional auto-push."""
         timestamp = datetime.now().strftime("%H:%M:%S")
+
+        # step 1: if auto_push, commit and push local changes first
+        if auto_push:
+            result = run_cmd(["git", "status", "--porcelain"], cwd=notes_dir, check=False, quiet=True)
+            if result.stdout.strip():
+                console.print(f"[dim]{timestamp}[/dim] [cyan]auto-push: committing local changes...[/cyan]")
+                run_cmd(["git", "add", "-A"], cwd=notes_dir, check=False, quiet=True)
+
+                # get hostname for commit message
+                import socket
+                hostname = socket.gethostname()
+                commit_msg = f"auto-sync from {hostname}"
+
+                result = run_cmd(["git", "commit", "-m", commit_msg], cwd=notes_dir, check=False, quiet=True)
+                if result.returncode == 0:
+                    console.print(f"[dim]{timestamp}[/dim] [cyan]auto-push: pushing...[/cyan]")
+                    push_result = run_cmd(["git", "push"], cwd=notes_dir, check=False, quiet=True)
+                    if push_result.returncode == 0:
+                        console.print(f"[dim]{timestamp}[/dim] [green]pushed local changes[/green]")
+                        send_notification("Notes Pushed", f"Auto-pushed changes from {hostname}")
+                    else:
+                        # push failed, probably need to pull first
+                        console.print(f"[dim]{timestamp}[/dim] [yellow]push failed, will pull and retry[/yellow]")
+
+        # step 2: check remote and pull if behind
+        behind, ahead, has_changes = get_status()
+
+        if behind == 0 and ahead == 0 and not has_changes:
+            console.print(f"[dim]{timestamp}[/dim] [green]up to date[/green]")
+            return
+
+        if behind == 0 and ahead > 0:
+            # we're ahead, just need to push
+            if auto_push:
+                console.print(f"[dim]{timestamp}[/dim] [cyan]pushing {ahead} commit(s)...[/cyan]")
+                result = run_cmd(["git", "push"], cwd=notes_dir, check=False, quiet=True)
+                if result.returncode == 0:
+                    console.print(f"[dim]{timestamp}[/dim] [green]pushed {ahead} commit(s)[/green]")
+                    send_notification("Notes Pushed", f"Pushed {ahead} commit(s)")
+                else:
+                    console.print(f"[dim]{timestamp}[/dim] [red]push failed[/red]")
+            else:
+                console.print(f"[dim]{timestamp}[/dim] [cyan]{ahead} commit(s) ahead (use --auto-push to push)[/cyan]")
+            return
 
         if behind == 0:
             console.print(f"[dim]{timestamp}[/dim] [green]up to date[/green]")
@@ -791,6 +835,13 @@ def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_c
             if do_pull():
                 console.print(f"[dim]{timestamp}[/dim] [green]pulled {behind} commit(s)[/green]")
                 send_notification("Notes Updated", f"Pulled {behind} commit(s) from GitHub")
+
+                # if auto_push and we have local commits, push them
+                if auto_push:
+                    _, new_ahead, _ = get_status()
+                    if new_ahead > 0:
+                        console.print(f"[dim]{timestamp}[/dim] [cyan]pushing {new_ahead} local commit(s)...[/cyan]")
+                        run_cmd(["git", "push"], cwd=notes_dir, check=False, quiet=True)
             else:
                 console.print(f"[dim]{timestamp}[/dim] [red]pull failed[/red]")
                 send_notification("Notes Pull Failed", "Check for conflicts")
@@ -819,10 +870,13 @@ def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_c
             return
 
         if on_conflict == "stash":
-            if auto_commit:
+            if auto_commit or auto_push:
                 console.print(f"[dim]{timestamp}[/dim] [cyan]auto-committing local changes...[/cyan]")
-                run_cmd(["git", "add", "-A"], cwd=notes_dir, quiet=True)
-                run_cmd(["git", "commit", "-m", "auto-commit before pull"], cwd=notes_dir, check=False, quiet=True)
+                run_cmd(["git", "add", "-A"], cwd=notes_dir, check=False, quiet=True)
+
+                import socket
+                hostname = socket.gethostname()
+                run_cmd(["git", "commit", "-m", f"auto-sync from {hostname}"], cwd=notes_dir, check=False, quiet=True)
                 has_changes = False
 
             if has_changes:
@@ -844,18 +898,28 @@ def notes_watch(interval: int, once: bool, notify: bool, auto_commit: bool, on_c
             if pull_ok:
                 console.print(f"[dim]{timestamp}[/dim] [green]pulled {behind} commit(s)[/green]")
                 send_notification("Notes Updated", f"Pulled {behind} commit(s) from GitHub")
+
+                # push if auto_push enabled
+                if auto_push:
+                    console.print(f"[dim]{timestamp}[/dim] [cyan]pushing...[/cyan]")
+                    push_result = run_cmd(["git", "push"], cwd=notes_dir, check=False, quiet=True)
+                    if push_result.returncode == 0:
+                        console.print(f"[dim]{timestamp}[/dim] [green]pushed[/green]")
+                    else:
+                        console.print(f"[dim]{timestamp}[/dim] [yellow]push failed[/yellow]")
             else:
                 console.print(f"[dim]{timestamp}[/dim] [red]pull failed[/red]")
                 send_notification("Notes Pull Failed", "Check for conflicts")
 
     # main loop
     console.print(f"[bold blue]watching notes[/bold blue] ({notes_dir})")
-    console.print(f"interval: {interval}s | conflict: {on_conflict} | notify: {notify}")
+    mode = "two-way sync" if auto_push else "pull only"
+    console.print(f"interval: {interval}s | mode: {mode} | conflict: {on_conflict} | notify: {notify}")
     console.print("[dim]press Ctrl+C to stop[/dim]\n")
 
     try:
         while True:
-            check_and_pull()
+            check_and_sync()
             if once:
                 break
             time.sleep(interval)
